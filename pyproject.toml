@@ -1,0 +1,35 @@
+[project]
+name = "visaebench-internal"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "overcomplete",
+    "numpy",
+    "pillow",
+    "tqdm",
+    "einops",
+    "transformers",
+    "python-dotenv",
+    "huggingface-hub",
+    "pyyaml",
+    "sentencepiece",
+    "protobuf",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
