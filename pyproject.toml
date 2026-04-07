@@ -16,6 +16,7 @@ dependencies = [
     "pyyaml",
     "sentencepiece",
     "protobuf",
+    "datasets",
 ]
 
 [[tool.uv.index]]

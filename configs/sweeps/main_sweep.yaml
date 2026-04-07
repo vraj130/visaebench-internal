@@ -1,0 +1,28 @@
+sweep_name: main_sweep
+description: "5 backbones x 3 expansions x 3 K values = 45 TopK SAE runs"
+
+backbones:
+  - clip_vitb16
+  - dinov2_vitb14
+  - siglip_vitb16
+  - mae_vitb16
+  - deit_vitb16
+
+architecture: topk
+
+expansion_factors:
+  - 8
+  - 16
+  - 32
+
+k_values:
+  - 128
+  - 192
+  - 256
+
+# Training hyperparameters (applied to all runs)
+training:
+  lr: 1e-3
+  batch_size: 4096
+  num_epochs: 3
+  seed: 42

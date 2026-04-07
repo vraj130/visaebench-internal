@@ -1,0 +1,20 @@
+sweep_name: seed_sweep
+description: "3 seeds on best config per backbone (fill in after main sweep)"
+
+backbones:
+  - clip_vitb16
+  - dinov2_vitb14
+  - siglip_vitb16
+  - mae_vitb16
+  - deit_vitb16
+
+architecture: topk
+expansion_factors: [16]  # placeholder - fill with best per backbone
+k_values: [192]          # placeholder - fill with best per backbone
+
+training:
+  lr: 1e-3
+  batch_size: 4096
+  num_epochs: 3
+
+seeds: [42, 123, 456]

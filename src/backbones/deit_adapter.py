@@ -1,21 +1,26 @@
 import torch
-from transformers import DeiTModel, DeiTImageProcessor
+from transformers import AutoModel, AutoImageProcessor
 
 from .base import BackboneAdapter
-from .token_utils import drop_cls_and_distillation, validate_shape
+from .token_utils import drop_cls, validate_shape
 
 MODEL_ID = "facebook/deit-base-patch16-224"
 
 
 class DeiTAdapter(BackboneAdapter):
-    """Adapter for DeiT ViT-B/16. Drops CLS (position 0) and distillation token (position 1)."""
+    """Adapter for DeiT ViT-B/16.
+
+    Uses AutoModel which loads the checkpoint as ViTModel, correctly
+    mapping the ``vit.``-prefixed weights. The resulting model has
+    CLS + 196 patch tokens (no distillation token), so we drop only CLS.
+    """
 
     def __init__(self, device: str = "cuda") -> None:
         super().__init__(model_id=MODEL_ID, device=device)
 
     def _load_model(self) -> None:
-        self.processor = DeiTImageProcessor.from_pretrained(self.model_id)
-        self.model = DeiTModel.from_pretrained(self.model_id)
+        self.processor = AutoImageProcessor.from_pretrained(self.model_id)
+        self.model = AutoModel.from_pretrained(self.model_id)
         self.model.eval()
         self.model.to(self.device)
 
@@ -29,6 +34,6 @@ class DeiTAdapter(BackboneAdapter):
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         outputs = self.model(**inputs, output_hidden_states=True)
         hidden_state = outputs.hidden_states[layer + 1]
-        patch_tokens = drop_cls_and_distillation(hidden_state)
+        patch_tokens = drop_cls(hidden_state)
         validate_shape(patch_tokens, self.patch_count, self.d_model)
         return patch_tokens

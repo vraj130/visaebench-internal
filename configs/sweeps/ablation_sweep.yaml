@@ -1,0 +1,24 @@
+sweep_name: ablation_sweep
+description: "TopK vs BatchTopK on CLIP + DINOv2 at 16x expansion"
+
+backbones:
+  - clip_vitb16
+  - dinov2_vitb14
+
+expansion_factors:
+  - 16
+
+k_values:
+  - 128
+  - 192
+  - 256
+
+architectures:
+  - topk
+  - batchtopk
+
+training:
+  lr: 1e-3
+  batch_size: 4096
+  num_epochs: 3
+  seed: 42

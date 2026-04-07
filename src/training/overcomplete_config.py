@@ -13,14 +13,16 @@ def make_sae_config(
     expansion_factor: int = 16,
     k: int = 192,
     architecture: str = "batchtopk",
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Return the config dict needed to instantiate an overcomplete SAE.
 
     Args:
         d_model:          Input dimension (ViT hidden dim).
         expansion_factor: Dictionary size multiplier (dict_size = d_model * expansion_factor).
-        k:                TopK sparsity — number of active features kept per batch step.
+        k:                Per-sample TopK sparsity — number of active features per sample.
         architecture:     One of "batchtopk", "topk", "jumprelu".
+        batch_size:       Required for "batchtopk" — top_k = k * batch_size.
 
     Returns:
         Dict with keys understood by the corresponding overcomplete constructor.
@@ -34,11 +36,12 @@ def make_sae_config(
         "k": k,
     }
     if architecture == "batchtopk":
+        if batch_size is None:
+            raise ValueError("batch_size is required for batchtopk (top_k = k * batch_size).")
         config["constructor_kwargs"] = {
             "input_shape": d_model,
             "nb_concepts": dict_size,
-            "top_k": k,
-            "threshold_momentum": 0.9,
+            "top_k": k * batch_size,
         }
     elif architecture == "topk":
         config["constructor_kwargs"] = {

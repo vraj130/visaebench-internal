@@ -1,16 +1,24 @@
 """Extract and cache layer activations from a ViT backbone on an image dataset.
 
-Usage (local directory):
+Usage (local image directory):
     python -m src.caching.cache_activations \
         --backbone clip_vitb16 \
         --dataset_dir /data/imagenet/train \
-        --output_dir ./activations/clip_vitb16/layer_11/ \
+        --output_dir /mnt/NAS/data/ds5725/visaebench/activations/clip_vitb16/layer_11/ \
         --num_images 10000
 
-Usage (HuggingFace streaming):
+Usage (locally downloaded HF dataset — recommended):
     python -m src.caching.cache_activations \
         --backbone dinov2_vitb14 \
-        --output_dir ./activations/dinov2_vitb14/layer_11/ \
+        --use_hf_local \
+        --output_dir /mnt/NAS/data/ds5725/visaebench/activations/dinov2_vitb14/layer_11/ \
+        --num_images 10000 \
+        --batch_size 64
+
+Usage (HuggingFace streaming — slower, no local copy kept):
+    python -m src.caching.cache_activations \
+        --backbone dinov2_vitb14 \
+        --output_dir /mnt/NAS/data/ds5725/visaebench/activations/dinov2_vitb14/layer_11/ \
         --use_hf_streaming \
         --num_images 10000 \
         --shard_size 5000 \
@@ -24,9 +32,12 @@ import json
 import os
 import time
 
+from tqdm import tqdm
+
 import torch
 from torch.utils.data import DataLoader, Subset
 
+import src.utils.paths  # noqa: F401  — redirects HF caches to data volume
 from src.backbones import load_backbone
 from src.caching.dataset import ImageFolderForCaching
 from src.caching.shard_utils import WelfordAccumulator, save_shard
@@ -49,6 +60,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to dataset root (ImageNet-style or flat directory of images). "
              "Not required when --use_hf_streaming is set.",
+    )
+    parser.add_argument(
+        "--use_hf_local",
+        action="store_true",
+        default=False,
+        help="Load from locally downloaded HF dataset cache at "
+             "DATASET_ROOT/imagenet-1k (run scripts/download_imagenet.py first).",
     )
     parser.add_argument(
         "--use_hf_streaming",
@@ -105,10 +123,106 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="DataLoader num_workers (default: 4).",
     )
+    parser.add_argument(
+        "--balanced",
+        action="store_true",
+        default=False,
+        help="Sample exactly num_images // 1000 images per ImageNet class instead of "
+             "taking the first N sequentially. Requires --num_images and works with "
+             "--use_hf_local and --use_hf_streaming.",
+    )
     args = parser.parse_args()
-    if not args.use_hf_streaming and args.dataset_dir is None:
-        parser.error("--dataset_dir is required unless --use_hf_streaming is set.")
+    if args.balanced and args.num_images is None:
+        parser.error("--balanced requires --num_images to be set.")
+    if args.balanced and args.dataset_dir is not None and not args.use_hf_local and not args.use_hf_streaming:
+        parser.error("--balanced is only supported with --use_hf_local or --use_hf_streaming.")
+    if not args.use_hf_streaming and not args.use_hf_local and args.dataset_dir is None:
+        parser.error("--dataset_dir is required unless --use_hf_streaming or --use_hf_local is set.")
     return args
+
+
+def _hf_balanced_batches(dataset_name: str, split: str, batch_size: int, num_images: int):
+    """Yield batches of PIL images sampled equally across all 1000 ImageNet classes.
+
+    Uses indexed access (non-streaming) to avoid scanning the full dataset:
+    1. Load the dataset with Arrow/mmap backing.
+    2. Pull the label column in one shot to build a class→indices map.
+    3. Randomly sample ``num_images // 1000`` indices per class.
+    4. Shuffle the combined indices and iterate only over those rows.
+
+    Args:
+        dataset_name: HuggingFace dataset identifier (e.g. "imagenet-1k").
+        split:        Dataset split (e.g. "train").
+        batch_size:   Number of images per yielded batch.
+        num_images:   Total images to return; must be a multiple of 1000.
+    """
+    import random
+    from datasets import load_dataset
+
+    per_class = num_images // 1000
+    num_classes = 1000
+    print(
+        f"[cache_activations] Balanced sampling: {per_class} images × {num_classes} classes "
+        f"= {per_class * num_classes} total"
+    )
+
+    print("[cache_activations] Loading dataset index (label column only)...")
+    hf_ds = load_dataset(dataset_name, split=split)
+
+    # Pull all labels in one vectorised call — fast with Arrow backing
+    all_labels: list[int] = hf_ds["label"]
+
+    # Build class → list-of-indices map
+    class_indices: list[list[int]] = [[] for _ in range(num_classes)]
+    for idx, lbl in enumerate(all_labels):
+        class_indices[lbl].append(idx)
+
+    # Sample per_class indices per class
+    rng = random.Random(42)
+    selected: list[int] = []
+    for lbl in range(num_classes):
+        pool = class_indices[lbl]
+        chosen = rng.sample(pool, min(per_class, len(pool)))
+        selected.extend(chosen)
+
+    total = len(selected)
+    print(f"[cache_activations] Balanced: {total} indices selected, building contiguous subset...")
+
+    # hf_ds.select() writes a contiguous Arrow table — may internally sort indices
+    # for read efficiency, so we apply a second shuffle on the subset row positions
+    # to ensure shards saved to disk are class-interleaved, not class-clustered.
+    subset = hf_ds.select(selected)
+    row_order = list(range(total))
+    rng.shuffle(row_order)
+    subset = subset.select(row_order)
+    print(f"[cache_activations] Subset ready (row-shuffled), iterating {total} images in batches of {batch_size}...")
+
+    # Prefetch the next decoded batch on a background thread so GPU is never
+    # idle waiting for JPEG decoding on the CPU.
+    import queue
+    import threading
+
+    _SENTINEL = object()
+
+    def _decode_worker(ds, bs, q):
+        for arrow_batch in ds.iter(batch_size=bs, drop_last_batch=False):
+            pil_images = []
+            for img in arrow_batch["image"]:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                pil_images.append(img)
+            q.put(pil_images)
+        q.put(_SENTINEL)
+
+    prefetch_q: queue.Queue = queue.Queue(maxsize=4)
+    t = threading.Thread(target=_decode_worker, args=(subset, batch_size, prefetch_q), daemon=True)
+    t.start()
+
+    while True:
+        item = prefetch_q.get()
+        if item is _SENTINEL:
+            break
+        yield item
 
 
 def _hf_streaming_batches(dataset_name: str, split: str, batch_size: int, num_images: int | None):
@@ -151,6 +265,26 @@ def _hf_streaming_batches(dataset_name: str, split: str, batch_size: int, num_im
         yield pil_buffer[:remaining]
 
 
+def _hf_local_batches(hf_ds, batch_size: int):
+    """Yield batches of PIL images from a locally loaded HuggingFace dataset.
+
+    Args:
+        hf_ds:      A datasets.Dataset object (already loaded into memory/mmap).
+        batch_size: Number of images per yielded batch.
+    """
+    pil_buffer: list = []
+    for example in hf_ds:
+        img = example["image"]
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        pil_buffer.append(img)
+        if len(pil_buffer) == batch_size:
+            yield pil_buffer
+            pil_buffer = []
+    if pil_buffer:
+        yield pil_buffer
+
+
 @torch.no_grad()
 def run(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -159,19 +293,33 @@ def run(args: argparse.Namespace) -> None:
     print(f"[cache_activations] Loading backbone '{args.backbone}'...")
     adapter = load_backbone(args.backbone, device=device)
 
-    if args.use_hf_streaming:
-        print(
-            f"[cache_activations] Streaming '{args.hf_dataset}' (split={args.hf_split}) "
-            f"from HuggingFace..."
-        )
+    if args.use_hf_local or args.use_hf_streaming:
+        source = "local parquet files" if args.use_hf_local else "HuggingFace"
+        hf_home = os.environ.get("HF_HOME", "")
         total_images = args.num_images
-        if total_images is not None:
-            print(f"[cache_activations] Will process up to {total_images} images.")
+
+        if args.balanced:
+            per_class = args.num_images // 1000
+            total_images = per_class * 1000
+            print(
+                f"[cache_activations] Balanced mode: {per_class} images/class × 1000 classes "
+                f"= {total_images} total from {source} (HF_HOME={hf_home})"
+            )
+            batch_iter = _hf_balanced_batches(
+                args.hf_dataset, args.hf_split, args.batch_size, args.num_images
+            )
         else:
-            print("[cache_activations] No --num_images limit set; will process full split.")
-        batch_iter = _hf_streaming_batches(
-            args.hf_dataset, args.hf_split, args.batch_size, args.num_images
-        )
+            print(
+                f"[cache_activations] Streaming '{args.hf_dataset}' (split={args.hf_split}) "
+                f"from {source} (HF_HOME={hf_home})"
+            )
+            if total_images is not None:
+                print(f"[cache_activations] Will process up to {total_images} images.")
+            else:
+                print("[cache_activations] No --num_images limit; will process full split.")
+            batch_iter = _hf_streaming_batches(
+                args.hf_dataset, args.hf_split, args.batch_size, args.num_images
+            )
     else:
         print(f"[cache_activations] Building dataset from '{args.dataset_dir}'...")
         dataset = ImageFolderForCaching(root_dir=args.dataset_dir, processor=adapter.processor)
@@ -198,7 +346,14 @@ def run(args: argparse.Namespace) -> None:
     images_processed = 0
     t_start = time.time()
 
-    for batch in batch_iter:
+    total_batches = (
+        (total_images + args.batch_size - 1) // args.batch_size
+        if total_images is not None else None
+    )
+    pbar = tqdm(batch_iter, total=total_batches, unit="batch",
+                desc="Caching activations", dynamic_ncols=True)
+
+    for batch in pbar:
         if isinstance(batch, list):
             activations = adapter.extract_patch_activations(batch, layer=args.layer)
         else:
@@ -210,6 +365,8 @@ def run(args: argparse.Namespace) -> None:
 
         shard_buffer.append(activations_cpu)
         images_processed += B
+
+        pbar.set_postfix(images=images_processed, img_s=f"{images_processed/(time.time()-t_start):.0f}")
 
         buffered = sum(t.shape[0] for t in shard_buffer)
         while buffered >= args.shard_size:
