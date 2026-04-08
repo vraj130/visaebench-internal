@@ -10,6 +10,7 @@ ACT_ROOT="/mnt/NAS/data/ds5725/visaebench/activations"
 CKPT_ROOT="/mnt/NAS/data/ds5725/visaebench/checkpoints"
 
 for backbone in $BACKBONES; do
+    source /mnt/NAS/home/ds5725/visaebench-internal/.visaebench/bin/activate
     outdir="${CKPT_ROOT}/${backbone}/batchtopk_16x_k192"
     if [ -f "${outdir}/sae.pt" ]; then
         echo "=== SKIP ${backbone} — already trained at ${outdir} ==="
@@ -18,7 +19,7 @@ for backbone in $BACKBONES; do
     echo "========================================"
     echo "Training ${backbone} BatchTopK 16x k192"
     echo "========================================"
-    python -m src.training.train_sae \
+    python3 -m src.training.train_sae \
         --backbone $backbone \
         --activation_dir ${ACT_ROOT}/${backbone}/layer_11/ \
         --output_dir $outdir \
