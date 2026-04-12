@@ -1,4 +1,5 @@
 from src.evaluation.base import MetricBase
+from src.evaluation.concept_detection.cross_domain import CrossDomainGeneralization
 from src.evaluation.concept_detection.monosemanticity import MonosemanticityScore
 from src.evaluation.concept_detection.sparse_probing import SparseProbing
 from src.evaluation.disentanglement.absorption import FeatureAbsorption
@@ -8,6 +9,7 @@ from src.evaluation.spatial_coherence.localization import FeatureLocalizationSco
 
 __all__ = [
     "MetricBase",
+    "CrossDomainGeneralization",
     "DownstreamPreservation",
     "FeatureAbsorption",
     "FVUMetric",
