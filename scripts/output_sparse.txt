@@ -1,0 +1,25 @@
+[sparse_probing] device=cpu
+[sparse_probing] SAE: batchtopk d=768 dict=12288 k=192
+[sparse_probing] 10 val shards from /mnt/NAS/data/ds5725/visaebench/activations_val/dinov2_vitb14/layer_11/
+[sparse_probing] Loading ImageNet val labels from HuggingFace...
+[sparse_probing] 50000 labels loaded
+
+==================================================
+M3 Sparse Probing Results
+==================================================
+  k_1024_accuracy: 0.6701
+  k_128_accuracy: 0.3954
+  k_16_accuracy: 0.0303
+  k_1_accuracy: 0.0022
+  k_256_accuracy: 0.4912
+  k_2_accuracy: 0.0025
+  k_32_accuracy: 0.1406
+  k_4_accuracy: 0.0047
+  k_512_accuracy: 0.5856
+  k_64_accuracy: 0.2926
+  k_8_accuracy: 0.0097
+  AUC: 0.5343
+  Images: 50000
+  Features: 12288
+==================================================
+Saved to /mnt/NAS/home/ds5725/visaebench-internal/results/raw/dinov2_vitb14_batchtopk_16x_k192_sparse_probing.json
