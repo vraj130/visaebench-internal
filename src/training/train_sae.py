@@ -83,6 +83,70 @@ def _discover_shards(activation_dir: str) -> list[str]:
     return paths
 
 
+def compute_batchtopk_threshold(
+    sae: torch.nn.Module,
+    shard_paths: list[str],
+    mean: torch.Tensor,
+    std: float,
+    device: str,
+    batch_size: int = 4096,
+    max_tokens: int = 10_000,
+) -> float:
+    """Compute a robust inference threshold for BatchTopK SAEs.
+
+    Runs the trained SAE in train mode on validation activations, collecting
+    the per-batch threshold (kth-largest activation in the flattened batch).
+    Returns the mean of these thresholds, which is more stable than the
+    EMA running_threshold for single-sample JumpReLU-style inference.
+    """
+    sae.train()  # train mode so encode() computes per-batch threshold
+    thresholds: list[float] = []
+    n_tok = 0
+
+    with torch.no_grad():
+        for shard_path in shard_paths:
+            if n_tok >= max_tokens:
+                break
+            shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+            N, P, D = shard.shape
+            tokens = shard.reshape(N * P, D).float()
+            tokens = (tokens - mean) / std
+
+            for start in range(0, len(tokens), batch_size):
+                if n_tok >= max_tokens:
+                    break
+                batch = tokens[start : start + batch_size].to(device)
+                if batch.shape[0] < batch_size:
+                    break  # skip incomplete batches — threshold depends on batch size
+
+                # Forward pass in train mode computes the threshold internally.
+                # We read it back from running_threshold after the EMA update.
+                _pre, codes, _x_hat = sae(batch)
+
+                # Recompute the exact current-batch threshold (same as encode())
+                flattened = codes.view(-1)
+                # The kth-largest non-zero value gives the effective threshold
+                nonzero_vals = flattened[flattened > 0]
+                if len(nonzero_vals) > 0:
+                    thresholds.append(float(nonzero_vals.min()))
+
+                n_tok += batch.shape[0]
+                del batch, _pre, codes, _x_hat
+
+            del shard, tokens
+
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    if not thresholds:
+        # Fall back to running_threshold if no thresholds were collected
+        if hasattr(sae, "running_threshold") and sae.running_threshold is not None:
+            return float(sae.running_threshold.item())
+        raise RuntimeError("No thresholds collected and no running_threshold available")
+
+    return sum(thresholds) / len(thresholds)
+
+
 def evaluate(
     sae: torch.nn.Module,
     shard_paths: list[str],
@@ -267,15 +331,33 @@ def main() -> None:
 
     print("[train_sae] Training complete.")
 
+    # ── Compute BatchTopK threshold (before saving) ────────────────────────────
+    threshold_value = None
+    if arch == "batchtopk":
+        if args.val_dir:
+            print("[train_sae] Computing robust BatchTopK threshold from val activations ...")
+            val_shards_for_thresh = _discover_shards(args.val_dir)
+            val_mean_t, val_std_t = _load_stats(args.val_dir)
+            threshold_value = compute_batchtopk_threshold(
+                sae, val_shards_for_thresh, val_mean_t, val_std_t,
+                device=device, batch_size=args.batch_size, max_tokens=10_000,
+            )
+            print(f"[train_sae] Computed threshold from val data: {threshold_value:.6f}")
+        elif hasattr(sae, "running_threshold") and sae.running_threshold is not None:
+            threshold_value = float(sae.running_threshold.item())
+            print(f"[train_sae] Using EMA running_threshold: {threshold_value:.6f}")
+        else:
+            print("[train_sae] WARNING: No threshold available — no val_dir and running_threshold is None")
+
     # ── Save checkpoint (before eval — safe if eval OOMs) ─────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
 
     sae_path = os.path.join(args.output_dir, "sae.pt")
-    # Include running_threshold for BatchTopKSAE — it's a plain attribute,
+    # Include _running_threshold for BatchTopKSAE — it's a plain attribute,
     # not a registered buffer, so state_dict() doesn't capture it.
     save_dict = sae.state_dict()
-    if arch == "batchtopk" and hasattr(sae, "running_threshold") and sae.running_threshold is not None:
-        save_dict["_running_threshold"] = sae.running_threshold.detach().cpu()
+    if arch == "batchtopk" and threshold_value is not None:
+        save_dict["_running_threshold"] = torch.tensor(threshold_value)
     torch.save(save_dict, sae_path)
     print(f"[train_sae] Saved weights → {sae_path}")
 
@@ -293,6 +375,8 @@ def main() -> None:
         "seed": args.seed,
         "activation_dir": args.activation_dir,
     }
+    if threshold_value is not None:
+        config_to_save["threshold"] = threshold_value
     config_path = os.path.join(args.output_dir, "config.yaml")
     with open(config_path, "w") as f:
         yaml.dump(config_to_save, f, default_flow_style=False)
