@@ -1,52 +1,67 @@
 # VisaeBench
 
-A benchmarking framework for evaluating Sparse Autoencoders (SAEs) trained on Vision Transformer (ViT) patch-token activations. Measures SAE quality across 7 metrics: reconstruction quality (FVU, downstream preservation), concept detection (sparse probing, monosemanticity, cross-domain), spatial coherence (localization), and disentanglement (absorption).
+A benchmarking framework for evaluating Sparse Autoencoders (SAEs) trained on Vision Transformer (ViT) patch-token activations. VisaeBench measures SAE quality across **7 metrics** spanning 4 capability dimensions: reconstruction quality, concept detection, spatial coherence, and disentanglement.
+
+## Why VisaeBench?
+
+Existing SAE evaluation benchmarks (e.g., SAEBench) focus on language models. Vision models introduce unique challenges — spatial structure, cross-model embeddings, and object-part localization — that require vision-specific evaluation. VisaeBench fills this gap with a comprehensive suite of metrics designed for the visual domain, including a novel **feature localization** metric that measures spatial coherence against ground-truth segmentation masks.
+
+## Metrics
+
+| # | Metric | Dimension | What it measures |
+|---|--------|-----------|------------------|
+| M1 | FVU (Fraction of Variance Unexplained) | Reconstruction | How well SAE reconstructs original activations |
+| M2 | Downstream Preservation | Reconstruction | Whether SAE reconstruction preserves downstream task performance |
+| M3 | Sparse Probing | Concept Detection | Whether k-sparse probes on SAE features can predict ImageNet classes |
+| M4 | Monosemanticity | Concept Detection | Whether top-activating images for each feature are semantically coherent (evaluated with cross-model embeddings) |
+| M5 | Cross-Domain | Concept Detection | Whether SAE features remain interpretable on OOD datasets (iNaturalist, EuroSAT) |
+| M6 | Feature Localization | Spatial Coherence | Whether SAE features are spatially coherent against segmentation masks |
+| M7 | Feature Absorption | Disentanglement | Whether SAE features absorb multiple concepts into single features |
+
+## Supported Backbones
+
+| Backbone | Model ID | Patch Count | Special Tokens |
+|----------|----------|-------------|----------------|
+| `clip_vitb16` | openai/clip-vit-base-patch16 | 196 | CLS |
+| `dinov2_vitb14` | facebook/dinov2-base | 256 | CLS + 4 registers |
+| `siglip_vitb16` | google/siglip-base-patch16-224 | 196 | None |
+| `mae_vitb16` | facebook/vit-mae-base | 196 | CLS |
+| `deit_vitb16` | facebook/deit-base-patch16-224 | 196 | CLS + distillation |
+
+All backbones extract activations from **layer 11** with d_model = 768.
 
 ## Setup
 
-Requires Python 3.11+ and CUDA (tested on RTX 3090).
+Requires Python 3.11+ and CUDA.
 
 ```bash
-# Create and activate virtual environment
 python -m venv .visaebench
 source .visaebench/bin/activate
-
-# Install dependencies (uses uv for PyTorch CUDA wheels)
 uv pip install -e .
 ```
 
-Set environment variables in `~/.bashrc` or `.env`:
+Set environment variables:
 
 ```bash
-export HF_HOME=/mnt/NAS/data/ds5725/visaebench/huggingface
-export HF_DATASETS_CACHE=/mnt/NAS/data/ds5725/visaebench/huggingface/datasets
+export HF_HOME=<your_hf_cache_dir>
+export HF_DATASETS_CACHE=<your_datasets_cache_dir>
 export HF_TOKEN=<your_token>
 ```
 
-## Pipeline Overview
+## Pipeline
 
 ```
 ImageNet images
-    --> cache_activations (extract ViT patch activations, save as shards)
-    --> train_sae (train SAE on cached activations)
-    --> evaluate (run M1-M7 metrics on trained SAE)
+    --> cache_activations   (extract ViT patch activations, save as shards)
+    --> train_sae           (train SAE on cached activations)
+    --> evaluate            (run M1-M7 metrics on trained SAE)
 ```
 
-## Step 1: Cache Activations
+### Step 1: Cache Activations
 
-Extract patch-token activations from ViT backbones and save as sharded `.pt` files.
+Extract patch-token activations from a ViT backbone and save as sharded `.pt` files.
 
-**Supported backbones:**
-
-| Backbone | Model ID | Patch Count |
-|----------|----------|-------------|
-| `clip_vitb16` | openai/clip-vit-base-patch16 | 196 |
-| `dinov2_vitb14` | facebook/dinov2-base | 256 |
-| `siglip_vitb16` | google/siglip-base-patch16-224 | 196 |
-| `mae_vitb16` | facebook/vit-mae-base | 196 |
-| `deit_vitb16` | facebook/deit-base-patch16-224 | 196 |
-
-**Cache training activations** (100K images, balanced across 1000 classes):
+**Training activations** (100K images, balanced across 1000 classes):
 
 ```bash
 python -m src.caching.cache_activations \
@@ -55,18 +70,18 @@ python -m src.caching.cache_activations \
     --hf_split train \
     --balanced \
     --num_images 100000 \
-    --output_dir /mnt/NAS/data/ds5725/visaebench/activations/dinov2_vitb14/layer_11/ \
+    --output_dir /path/to/activations/dinov2_vitb14/layer_11/ \
     --batch_size 512
 ```
 
-**Cache validation activations** (full 50K val set, sequential order for label alignment):
+**Validation activations** (full 50K val set, sequential order for label alignment):
 
 ```bash
 python -m src.caching.cache_activations \
     --backbone dinov2_vitb14 \
     --use_hf_local \
     --hf_split validation \
-    --output_dir /mnt/NAS/data/ds5725/visaebench/activations_val/dinov2_vitb14/layer_11/ \
+    --output_dir /path/to/activations_val/dinov2_vitb14/layer_11/ \
     --batch_size 512
 ```
 
@@ -81,25 +96,21 @@ bash scripts/cache_all_backbones.sh          # val (50K sequential)
 
 ```
 activations/{backbone}/layer_11/
-    shard_000.pt   # [N, patch_count, 768] float16
+    shard_000.pt       # [N, patch_count, 768] float16
     shard_001.pt
     ...
-    stats.json     # mean (per-dim), std (scalar), num_images, d_model
+    stats.json          # mean, std, num_images, d_model
 ```
 
-Each shard contains ~5000 images. `stats.json` provides the normalization statistics used during training.
+### Step 2: Train SAE
 
-## Step 2: Train SAE
-
-Train a Sparse Autoencoder on cached activations. Supports TopK and BatchTopK architectures from the `overcomplete` library.
-
-**Train a single SAE:**
+Train a Sparse Autoencoder on cached activations. Supports **TopK** and **BatchTopK** architectures from the `overcomplete` library.
 
 ```bash
 python -m src.training.train_sae \
     --backbone dinov2_vitb14 \
-    --activation_dir /mnt/NAS/data/ds5725/visaebench/activations/dinov2_vitb14/layer_11/ \
-    --output_dir /mnt/NAS/data/ds5725/visaebench/checkpoints/dinov2_vitb14/batchtopk_16x_k192/ \
+    --activation_dir /path/to/activations/dinov2_vitb14/layer_11/ \
+    --output_dir /path/to/checkpoints/dinov2_vitb14/batchtopk_16x_k192/ \
     --expansion_factor 16 \
     --k 192 \
     --architecture batchtopk \
@@ -109,58 +120,66 @@ python -m src.training.train_sae \
     --seed 42
 ```
 
-**Key arguments:**
+**Key training arguments:**
 
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--architecture` | `topk` or `batchtopk` | `topk` |
-| `--expansion_factor` | Dictionary size = d_model x factor | 16 |
+| `--expansion_factor` | Dictionary size = d_model × factor | 16 |
 | `--k` | Per-sample sparsity (active features) | 192 |
 | `--batch_size` | Patch tokens per batch | 4096 |
 | `--num_epochs` | Passes over all shards | 3 |
-| `--val_dir` | Val shard directory (optional, for eval after training) | None |
-| `--wandb_project` | W&B project name (optional) | None |
-
-**BatchTopK note:** The `top_k` parameter passed to `BatchTopKSAE` is `k * batch_size` (e.g., 192 x 4096 = 786,432). This is handled automatically by `make_sae_config()` when `batch_size` is provided.
-
-**Train all 5 backbones** (same config, skips existing):
-
-```bash
-bash scripts/train_batchtopk_all.sh
-```
 
 **Checkpoint output:**
 
 ```
 checkpoints/{backbone}/batchtopk_16x_k192/
-    sae.pt            # model state dict (includes _running_threshold for BatchTopK)
-    config.yaml       # training config (backbone, architecture, d_model, k, etc.)
-    training_log.json # per-step loss + final eval metrics
+    sae.pt              # model state dict
+    config.yaml         # training config snapshot
+    training_log.json   # per-step loss + final eval metrics
 ```
 
-Training processes shards one at a time to stay within RAM limits (~8 GB free).
+### Step 3: Evaluate
 
-## Step 3: Run Sweep
+Run individual metrics or all metrics at once.
 
-For systematic experiments across multiple backbones, expansion factors, and k values.
+**M1: FVU**
 
-**Define a sweep** in `configs/sweeps/`:
+```python
+from src.evaluation.reconstruction.fvu import FVUMetric
 
-```yaml
-# configs/sweeps/main_sweep.yaml
-sweep_name: main_sweep
-backbones: [clip_vitb16, dinov2_vitb14, siglip_vitb16, mae_vitb16, deit_vitb16]
-architecture: topk
-expansion_factors: [8, 16, 32]
-k_values: [128, 192, 256]
-training:
-  lr: 1e-3
-  batch_size: 4096
-  num_epochs: 3
-  seed: 42
+metric = FVUMetric(batch_size=512)
+results = metric.evaluate(sae, shard_paths, mean, std, device="cuda", dict_size=12288)
+# {"fvu": 0.1009, "l0": 208.0, "dead_features": 172, "dead_pct": 1.4}
 ```
 
-**Run the sweep:**
+**M3: Sparse Probing**
+
+```bash
+python scripts/run_sparse_probing.py \
+    --sae_checkpoint /path/to/checkpoints/dinov2_vitb14/batchtopk_16x_k192/sae.pt \
+    --sae_config /path/to/checkpoints/dinov2_vitb14/batchtopk_16x_k192/config.yaml \
+    --activation_dir /path/to/activations_val/dinov2_vitb14/layer_11/
+```
+
+**M7: Feature Absorption**
+
+```bash
+python scripts/run_absorption.py \
+    --sae_checkpoint /path/to/checkpoints/dinov2_vitb14/batchtopk_16x_k192/sae.pt \
+    --sae_config /path/to/checkpoints/dinov2_vitb14/batchtopk_16x_k192/config.yaml \
+    --activation_dir /path/to/activations_val/dinov2_vitb14/layer_11/
+```
+
+**Run all metrics:**
+
+```bash
+bash scripts/run_all_evals.sh
+```
+
+### Sweeps
+
+For systematic experiments across backbones, expansion factors, and k values.
 
 ```bash
 # Preview all commands
@@ -173,50 +192,10 @@ python -m src.training.sweep_runner --sweep_config configs/sweeps/main_sweep.yam
 python -m src.training.sweep_runner --sweep_config configs/sweeps/main_sweep.yaml --mode slurm --slurm_partition gpu
 ```
 
-## Step 4: Evaluate
-
-### M1: FVU (Fraction of Variance Unexplained)
-
-Measures reconstruction quality. Computed incrementally over val shards.
-
-```python
-from src.evaluation.reconstruction.fvu import FVUMetric
-
-metric = FVUMetric(batch_size=512)
-results = metric.evaluate(sae, shard_paths, mean, std, device="cuda", dict_size=12288)
-# {"fvu": 0.1009, "l0": 208.0, "dead_features": 172, "dead_pct": 1.4}
-```
-
-### M3: Sparse Probing
-
-Measures concept alignment by training k-sparse linear probes on SAE features to predict ImageNet classes.
-
-```bash
-python scripts/run_sparse_probing.py \
-    --sae_checkpoint /mnt/NAS/data/ds5725/visaebench/checkpoints/dinov2_vitb14/batchtopk_16x_k192/sae.pt \
-    --sae_config /mnt/NAS/data/ds5725/visaebench/checkpoints/dinov2_vitb14/batchtopk_16x_k192/config.yaml \
-    --activation_dir /mnt/NAS/data/ds5725/visaebench/activations_val/dinov2_vitb14/layer_11/ \
-    --output_path results/raw/dinov2_vitb14_batchtopk_16x_k192_sparse_probing.json
-```
-
-## Data Storage
-
-All heavy artifacts live on NAS at `/mnt/NAS/data/ds5725/visaebench/`. Never store large files under `/mnt/NAS/home/`.
-
-```
-/mnt/NAS/data/ds5725/visaebench/
-    activations/         # train shards per backbone/layer
-    activations_val/     # val shards per backbone/layer
-    checkpoints/         # trained SAE weights + configs
-    huggingface/         # HF model & dataset cache
-    results/             # evaluation results JSON
-```
-
-Import paths from `src.utils.paths`:
-
-```python
-from src.utils.paths import ACTIVATION_ROOT, CHECKPOINT_ROOT, DATA_ROOT
-```
+Sweep configs are defined in `configs/sweeps/`:
+- `main_sweep.yaml` — 5 backbones × 3 expansions × 3 k values = 45 runs
+- `ablation_sweep.yaml` — TopK + JumpReLU on CLIP & DINOv2
+- `seed_sweep.yaml` — 3 seeds on best config per backbone
 
 ## Project Structure
 
@@ -224,19 +203,31 @@ from src.utils.paths import ACTIVATION_ROOT, CHECKPOINT_ROOT, DATA_ROOT
 src/
     backbones/           # ViT backbone adapters (CLIP, DINOv2, SigLIP, MAE, DeiT)
     caching/             # Activation extraction and sharding
-    training/            # SAE training (train_sae.py) and sweep runner
-    evaluation/          # Metrics: M1 FVU, M3 sparse probing, (M2/M4-M7 planned)
-    analysis/            # Post-eval aggregation and visualization (planned)
-    utils/               # Path constants, env setup
+    training/            # SAE training and sweep runner
+    evaluation/         # Metrics M1–M7 + EvalRunner
+        reconstruction/  # M1: FVU, M2: Downstream Preservation
+        concept_detection/  # M3: Sparse Probing, M4: Monosemanticity, M5: Cross-Domain
+        spatial_coherence/  # M6: Feature Localization
+        disentanglement/    # M7: Feature Absorption
+    analysis/            # Result aggregation, hypothesis tests, Pareto, visualization
+    utils/               # Path constants, IO helpers, logging
 configs/
-    sweeps/              # Sweep YAML configs (main, ablation, seed)
-scripts/                 # CLI entry points and batch scripts
-notebooks/               # Interactive exploration and pilot experiments
+    backbones/           # Per-backbone YAML configs
+    sae/                 # SAE architecture configs (BatchTopK, TopK, JumpReLU)
+    eval/                # Evaluation metric configs
+    sweeps/              # Sweep experiment definitions
+scripts/                # CLI entry points and batch scripts
+notebooks/              # Exploratory notebooks (backbone shapes, metric design, results)
+paper/                  # NeurIPS 2026 submission (main.tex, appendix, references)
 ```
 
-## Hardware
+## Dependencies
 
-- **GPUs:** 2x RTX 3090 (24 GB VRAM each); GPU 0 is primary
-- **RAM:** ~62 GB total, ~8-9 GB typically free
-- **Storage:** NFS-mounted NAS at `/mnt/NAS/`
-- Training is shard-by-shard to stay within RAM limits
+- Python 3.11+
+- PyTorch 2.6 (CUDA 12.4)
+- [overcomplete](https://github.com/nicandris/overcomplete) — SAE architectures (TopK, BatchTopK)
+- HuggingFace transformers & datasets
+- timm, open-clip-torch
+- einops, numpy, pillow, tqdm, pyyaml
+
+See `pyproject.toml` for the full dependency list.
