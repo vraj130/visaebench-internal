@@ -131,6 +131,13 @@ def parse_args() -> argparse.Namespace:
              "taking the first N sequentially. Requires --num_images and works with "
              "--use_hf_local and --use_hf_streaming.",
     )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        default=False,
+        help="Save activations as float16 instead of float32 (halves disk usage). "
+             "Training code casts to float32 on load, so this is safe.",
+    )
     args = parser.parse_args()
     if args.balanced and args.num_images is None:
         parser.error("--balanced requires --num_images to be set.")
@@ -265,24 +272,41 @@ def _hf_streaming_batches(dataset_name: str, split: str, batch_size: int, num_im
         yield pil_buffer[:remaining]
 
 
-def _hf_local_batches(hf_ds, batch_size: int):
+def _hf_local_batches(hf_ds, batch_size: int, num_prefetch: int = 4):
     """Yield batches of PIL images from a locally loaded HuggingFace dataset.
 
+    Uses a background thread to decode JPEG images ahead of the GPU so the
+    forward pass never stalls waiting for CPU-side image decoding.
+
     Args:
-        hf_ds:      A datasets.Dataset object (already loaded into memory/mmap).
-        batch_size: Number of images per yielded batch.
+        hf_ds:         A datasets.Dataset object (already loaded into memory/mmap).
+        batch_size:    Number of images per yielded batch.
+        num_prefetch:  Number of batches to decode ahead in background.
     """
-    pil_buffer: list = []
-    for example in hf_ds:
-        img = example["image"]
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        pil_buffer.append(img)
-        if len(pil_buffer) == batch_size:
-            yield pil_buffer
-            pil_buffer = []
-    if pil_buffer:
-        yield pil_buffer
+    import queue
+    import threading
+
+    _SENTINEL = object()
+
+    def _decode_worker(ds, bs, q):
+        for arrow_batch in ds.iter(batch_size=bs, drop_last_batch=False):
+            pil_images = []
+            for img in arrow_batch["image"]:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                pil_images.append(img)
+            q.put(pil_images)
+        q.put(_SENTINEL)
+
+    prefetch_q: queue.Queue = queue.Queue(maxsize=num_prefetch)
+    t = threading.Thread(target=_decode_worker, args=(hf_ds, batch_size, prefetch_q), daemon=True)
+    t.start()
+
+    while True:
+        item = prefetch_q.get()
+        if item is _SENTINEL:
+            break
+        yield item
 
 
 @torch.no_grad()
@@ -308,7 +332,19 @@ def run(args: argparse.Namespace) -> None:
             batch_iter = _hf_balanced_batches(
                 args.hf_dataset, args.hf_split, args.batch_size, args.num_images
             )
+        elif args.use_hf_local:
+            # Fast indexed path: Arrow-backed mmap, prefetched decoding
+            from datasets import load_dataset
+            print(f"[cache_activations] Loading indexed dataset '{args.hf_dataset}' (split={args.hf_split}) ...")
+            hf_ds = load_dataset(args.hf_dataset, split=args.hf_split)
+            if total_images is not None:
+                hf_ds = hf_ds.select(range(min(total_images, len(hf_ds))))
+            else:
+                total_images = len(hf_ds)
+            print(f"[cache_activations] {total_images} images, prefetched batches of {args.batch_size}")
+            batch_iter = _hf_local_batches(hf_ds, args.batch_size)
         else:
+            # True streaming from HuggingFace (no local copy)
             print(
                 f"[cache_activations] Streaming '{args.hf_dataset}' (split={args.hf_split}) "
                 f"from {source} (HF_HOME={hf_home})"
@@ -353,11 +389,14 @@ def run(args: argparse.Namespace) -> None:
     pbar = tqdm(batch_iter, total=total_batches, unit="batch",
                 desc="Caching activations", dynamic_ncols=True)
 
+    use_amp = device == "cuda"
+
     for batch in pbar:
-        if isinstance(batch, list):
-            activations = adapter.extract_patch_activations(batch, layer=args.layer)
-        else:
-            activations = adapter.extract_patch_activations(batch.to(device), layer=args.layer)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            if isinstance(batch, list):
+                activations = adapter.extract_patch_activations(batch, layer=args.layer)
+            else:
+                activations = adapter.extract_patch_activations(batch.to(device), layer=args.layer)
         activations_cpu = activations.cpu().float()
 
         B, P, D = activations_cpu.shape
@@ -374,7 +413,7 @@ def run(args: argparse.Namespace) -> None:
             shard_tensor = full[: args.shard_size]
             remainder = full[args.shard_size :]
 
-            path = save_shard(shard_tensor, args.output_dir, shard_idx)
+            path = save_shard(shard_tensor, args.output_dir, shard_idx, half=args.half)
             elapsed = time.time() - t_start
             rate = images_processed / elapsed if elapsed > 0 else float("inf")
             if total_images is not None:
@@ -400,7 +439,7 @@ def run(args: argparse.Namespace) -> None:
 
     if shard_buffer:
         final_tensor = torch.cat(shard_buffer, dim=0)
-        path = save_shard(final_tensor, args.output_dir, shard_idx)
+        path = save_shard(final_tensor, args.output_dir, shard_idx, half=args.half)
         total_str = f"/{total_images}" if total_images is not None else ""
         print(
             f"  Saved final shard {path}  |  images processed: {images_processed}{total_str}"
