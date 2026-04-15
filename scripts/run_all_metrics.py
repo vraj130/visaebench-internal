@@ -146,7 +146,7 @@ def encode_val_data(
     recon_mmap = np.memmap(tmp_recon_path, dtype=np.float32, mode="w+",
                            shape=(total_images, d_model))
 
-    group_size = 16
+    group_size = 512
     write_idx = 0
 
     pbar = tqdm(total=total_images, desc="Shared encoding", unit="img")

@@ -6,20 +6,23 @@ from typing import Dict, List
 import torch
 
 
-def save_shard(activations: torch.Tensor, output_dir: str, shard_idx: int) -> str:
+def save_shard(activations: torch.Tensor, output_dir: str, shard_idx: int,
+               half: bool = False) -> str:
     """Save activation tensor as shard_XXX.pt inside output_dir.
 
     Args:
         activations: Tensor of shape [N, num_patches, d_model].
         output_dir:  Directory to write the shard into.
         shard_idx:   Zero-based shard index used for the filename.
+        half:        If True, save as float16 (halves disk usage).
 
     Returns:
         Absolute path of the written file.
     """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"shard_{shard_idx:03d}.pt")
-    torch.save(activations.float(), path)
+    tensor = activations.half() if half else activations.float()
+    torch.save(tensor, path)
     return path
 
 
