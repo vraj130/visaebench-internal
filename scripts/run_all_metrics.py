@@ -24,7 +24,6 @@ Usage:
 import argparse
 import json
 import os
-import tempfile
 import time
 import traceback
 
@@ -97,7 +96,13 @@ def load_sae(
 
 # ---------------------------------------------------------------------------
 # Shared encoding: encode val data once for M2, M3, M4, M7
+# Also computes M1 (FVU) stats when compute_fvu=True to avoid a second pass.
 # ---------------------------------------------------------------------------
+
+def _prefetch_shard(path: str) -> torch.Tensor:
+    """Load a shard from disk (used by background prefetch thread)."""
+    return torch.load(path, map_location="cpu", weights_only=True)
+
 
 def encode_val_data(
     sae: torch.nn.Module,
@@ -107,28 +112,44 @@ def encode_val_data(
     device: str,
     dict_size: int,
     encode_batch_size: int = 512,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    compute_fvu: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict | None]:
     """Process all val shards through the SAE once.
 
     Returns:
-        image_codes:          np.ndarray [num_images, dict_size]  — max-pooled SAE codes
-        pooled_original:      np.ndarray [num_images, 768]        — max-pooled original activations
-        pooled_reconstructed: np.ndarray [num_images, 768]        — max-pooled SAE reconstructions
+        image_codes:          np.ndarray [num_images, dict_size]
+        pooled_original:      np.ndarray [num_images, d_model]
+        pooled_reconstructed: np.ndarray [num_images, d_model]
+        fvu_stats:            dict with FVU results, or None if compute_fvu=False
     """
+    import tempfile
+
+    from concurrent.futures import ThreadPoolExecutor
     from tqdm import tqdm
 
     sae.eval()
     d_model = mean.shape[0]
 
-    # Count total images across shards for memmap pre-allocation
-    shard_sizes = []
-    for sp in tqdm(shard_paths, desc="Counting images"):
-        s = torch.load(sp, map_location="cpu", weights_only=True)
-        shard_sizes.append(s.shape[0])
-        del s
-    total_images = sum(shard_sizes)
+    group_size = 256
 
-    # Create memmaps to avoid accumulating multi-GB arrays in RAM
+    # FVU running statistics (M1) — computed alongside encoding
+    fvu_n_tok = 0
+    fvu_sum_x2 = 0.0
+    fvu_sum_x = 0.0
+    fvu_sum_res2 = 0.0
+    fvu_sum_res = 0.0
+    fvu_sum_l0 = 0.0
+    fvu_ever_active = torch.zeros(dict_size, dtype=torch.bool)
+
+    # Fast counting via mmap (reads metadata only, no data loaded to RAM)
+    total_images = 0
+    for sp in shard_paths:
+        s = torch.load(sp, map_location="cpu", weights_only=True, mmap=True)
+        total_images += s.shape[0]
+        del s
+
+    # Pre-allocate file-backed memmaps so the OS can page them out during
+    # later GPU-heavy metrics (M5, M6) without swapping.
     tmp_codes = tempfile.NamedTemporaryFile(suffix="_codes.dat", delete=False)
     tmp_orig = tempfile.NamedTemporaryFile(suffix="_orig.dat", delete=False)
     tmp_recon = tempfile.NamedTemporaryFile(suffix="_recon.dat", delete=False)
@@ -146,14 +167,23 @@ def encode_val_data(
     recon_mmap = np.memmap(tmp_recon_path, dtype=np.float32, mode="w+",
                            shape=(total_images, d_model))
 
-    group_size = 512
     write_idx = 0
-
     pbar = tqdm(total=total_images, desc="Shared encoding", unit="img")
 
-    with torch.no_grad():
-        for shard_path in shard_paths:
-            shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+    with torch.no_grad(), ThreadPoolExecutor(max_workers=1) as prefetcher:
+        # Submit first shard load
+        future = prefetcher.submit(_prefetch_shard, shard_paths[0])
+
+        for shard_idx in range(len(shard_paths)):
+            # Wait for current shard (already loading in background)
+            shard = future.result()
+
+            # Prefetch next shard while we process this one
+            if shard_idx + 1 < len(shard_paths):
+                future = prefetcher.submit(
+                    _prefetch_shard, shard_paths[shard_idx + 1],
+                )
+
             N, P, D = shard.shape
 
             for g_start in range(0, N, group_size):
@@ -170,22 +200,37 @@ def encode_val_data(
                 # Flatten for SAE encoding
                 tokens = normed.reshape(G * P, D)
 
-                code_chunks: list[torch.Tensor] = []
-                recon_chunks: list[torch.Tensor] = []
+                group_code_chunks: list[torch.Tensor] = []
+                group_recon_chunks: list[torch.Tensor] = []
 
                 for s in range(0, tokens.shape[0], encode_batch_size):
                     batch = tokens[s : s + encode_batch_size].to(device)
                     _pre, codes, x_hat = sae(batch)
-                    code_chunks.append(codes.cpu())
-                    recon_chunks.append(x_hat.cpu())
+
+                    # M1 FVU stats — accumulated per token before pooling
+                    if compute_fvu:
+                        res = batch - x_hat
+                        fvu_sum_x2 += float(batch.pow(2).sum())
+                        fvu_sum_x += float(batch.sum())
+                        fvu_sum_res2 += float(res.pow(2).sum())
+                        fvu_sum_res += float(res.sum())
+                        fvu_sum_l0 += float(
+                            (codes != 0).float().sum(dim=1).sum()
+                        )
+                        fvu_ever_active |= (codes != 0).any(dim=0).cpu()
+                        fvu_n_tok += batch.shape[0]
+                        del res
+
+                    group_code_chunks.append(codes.cpu())
+                    group_recon_chunks.append(x_hat.cpu())
                     del batch, _pre, codes, x_hat
 
                 # Codes: [G*P, dict_size] -> [G, P, dict_size] -> max-pool -> [G, dict_size]
-                all_codes = torch.cat(code_chunks, dim=0).reshape(G, P, -1)
+                all_codes = torch.cat(group_code_chunks, dim=0).reshape(G, P, -1)
                 pooled_codes = all_codes.max(dim=1).values.numpy()
 
                 # Reconstructions: [G*P, D] -> [G, P, D] -> max-pool -> [G, D]
-                all_recon = torch.cat(recon_chunks, dim=0).reshape(G, P, D)
+                all_recon = torch.cat(group_recon_chunks, dim=0).reshape(G, P, D)
                 recon_pooled = all_recon.max(dim=1).values.numpy()
 
                 codes_mmap[write_idx : write_idx + G] = pooled_codes
@@ -195,7 +240,7 @@ def encode_val_data(
                 write_idx += G
                 pbar.update(G)
 
-                del group, normed, tokens, code_chunks, recon_chunks
+                del group, normed, tokens, group_code_chunks, group_recon_chunks
                 del all_codes, pooled_codes, all_recon, recon_pooled, orig_pooled
 
             del shard
@@ -222,7 +267,22 @@ def encode_val_data(
     atexit.register(lambda: os.unlink(tmp_orig_path))
     atexit.register(lambda: os.unlink(tmp_recon_path))
 
-    return image_codes, pooled_original, pooled_reconstructed
+    # Compute FVU result dict
+    fvu_stats = None
+    if compute_fvu and fvu_n_tok > 0:
+        var_x = fvu_sum_x2 / fvu_n_tok - (fvu_sum_x / fvu_n_tok) ** 2
+        var_res = fvu_sum_res2 / fvu_n_tok - (fvu_sum_res / fvu_n_tok) ** 2
+        fvu = float(var_res / var_x)
+        l0 = float(fvu_sum_l0 / fvu_n_tok)
+        dead_count = int((~fvu_ever_active).sum())
+        fvu_stats = {
+            "fvu": fvu,
+            "l0": l0,
+            "dead_features": dead_count,
+            "dead_pct": 100.0 * dead_count / dict_size,
+        }
+
+    return image_codes, pooled_original, pooled_reconstructed, fvu_stats
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +290,7 @@ def encode_val_data(
 # ---------------------------------------------------------------------------
 
 def run_m1_fvu(sae, shard_paths, mean, std, device, dict_size, encode_batch_size):
-    """M1: FVU — needs its own shard-by-shard pass (incremental variance)."""
+    """M1: FVU — standalone fallback when shared encoding is not run."""
     from src.evaluation.reconstruction.fvu import FVUMetric
     metric = FVUMetric(batch_size=encode_batch_size)
     return metric.evaluate(
@@ -239,13 +299,25 @@ def run_m1_fvu(sae, shard_paths, mean, std, device, dict_size, encode_batch_size
     )
 
 
+def _fit_probe(X_train, y_train, X_test, y_test, max_iter=1000, seed=42):
+    """Train a single logistic regression probe and return accuracy."""
+    import os
+    from sklearn.linear_model import LogisticRegression
+    # Limit BLAS threads so parallel probes don't contend
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    os.environ.setdefault("MKL_NUM_THREADS", "4")
+    clf = LogisticRegression(solver="lbfgs", max_iter=max_iter, C=1.0,
+                             random_state=seed)
+    clf.fit(X_train, y_train)
+    return float(clf.score(X_test, y_test))
+
+
 def run_m2_downstream(sae, shard_paths, mean, std, device, dict_size,
                       labels, pooled_original, pooled_reconstructed,
                       encode_batch_size):
     """M2: Downstream Preservation — uses precomputed pooled data."""
-    from sklearn.linear_model import LogisticRegression
+    from joblib import Parallel, delayed
     from sklearn.model_selection import train_test_split
-    from tqdm import tqdm
 
     num_images = pooled_original.shape[0]
     seed = 42
@@ -260,21 +332,19 @@ def run_m2_downstream(sae, shard_paths, mean, std, device, dict_size,
         test_size=test_size, stratify=labels, random_state=seed,
     )
 
-    probe_steps = tqdm(
-        [("original", pooled_original), ("reconstructed", pooled_reconstructed)],
-        desc="M2 probes",
+    probes = [
+        ("original", pooled_original),
+        ("reconstructed", pooled_reconstructed),
+    ]
+    print(f"[M2] Training 2 probes in parallel...")
+    accs = Parallel(n_jobs=2)(
+        delayed(_fit_probe)(
+            data[idx_train], y_train, data[idx_test], y_test,
+            max_iter=1000, seed=seed,
+        )
+        for _name, data in probes
     )
-    accuracies = {}
-    for name, data in probe_steps:
-        probe_steps.set_postfix(probe=name)
-        clf = LogisticRegression(solver="lbfgs", max_iter=1000, C=1.0,
-                                 random_state=seed)
-        clf.fit(data[idx_train], y_train)
-        accuracies[name] = float(clf.score(data[idx_test], y_test))
-        del clf
-
-    acc_orig = accuracies["original"]
-    acc_recon = accuracies["reconstructed"]
+    acc_orig, acc_recon = accs
     preservation = acc_recon / acc_orig if acc_orig > 0 else 0.0
 
     return {
@@ -286,12 +356,26 @@ def run_m2_downstream(sae, shard_paths, mean, std, device, dict_size,
     }
 
 
+def _fit_sparse_probe(k, ranked_indices, X_train, y_train, X_test, y_test,
+                      seed=42):
+    """Train one sparse probe for a given k and return (k, accuracy)."""
+    import os
+    from sklearn.linear_model import LogisticRegression
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    os.environ.setdefault("MKL_NUM_THREADS", "4")
+    top_k_idx = ranked_indices[:k]
+    clf = LogisticRegression(solver="lbfgs", max_iter=500, C=1.0,
+                             random_state=seed)
+    clf.fit(X_train[:, top_k_idx], y_train)
+    acc = float(clf.score(X_test[:, top_k_idx], y_test))
+    return k, acc
+
+
 def run_m3_sparse_probing(image_codes, labels, dict_size):
     """M3: Sparse Probing — uses precomputed image codes."""
+    from joblib import Parallel, delayed
     from sklearn.feature_selection import f_classif
-    from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import train_test_split
-    from tqdm import tqdm
 
     k_values = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
     seed = 42
@@ -312,16 +396,16 @@ def run_m3_sparse_probing(image_codes, labels, dict_size):
         test_size=0.2, stratify=labels, random_state=seed,
     )
 
-    results: dict = {}
-    for k in tqdm(k_values, desc="M3 sparse probes"):
-        top_k_idx = ranked_indices[:k]
-        X_tr_k = X_train[:, top_k_idx]
-        X_te_k = X_test[:, top_k_idx]
+    print(f"[M3] Training {len(k_values)} probes in parallel...")
+    pairs = Parallel(n_jobs=len(k_values))(
+        delayed(_fit_sparse_probe)(
+            k, ranked_indices, X_train, y_train, X_test, y_test, seed,
+        )
+        for k in k_values
+    )
 
-        clf = LogisticRegression(solver="lbfgs", max_iter=500, C=1.0,
-                                 random_state=seed)
-        clf.fit(X_tr_k, y_train)
-        acc = float(clf.score(X_te_k, y_test))
+    results: dict = {}
+    for k, acc in pairs:
         results[f"k_{k}_accuracy"] = acc
 
     ks = sorted(k_values)
@@ -518,24 +602,31 @@ def main() -> None:
         labels = load_imagenet_val_labels()
         print(f"{len(labels)} labels loaded")
 
-    # ── Shared encoding (needed by M2, M3, M4, M7) ──────────────────────
+    # ── Shared encoding (needed by M2, M3, M4, M7; also computes M1) ────
     needs_shared_encoding = metrics_to_run & {"m2", "m3", "m4", "m7"}
     image_codes = None
     pooled_original = None
     pooled_reconstructed = None
+    fvu_stats = None  # M1 result computed during encoding
 
     if needs_shared_encoding:
+        # Piggyback M1 onto the shared pass to avoid a separate shard scan
+        compute_fvu = "m1" in metrics_to_run
         print("\n--- Shared Encoding Pass ---")
+        if compute_fvu:
+            print("(M1 FVU stats computed during this pass)")
         t0 = time.time()
-        image_codes, pooled_original, pooled_reconstructed = encode_val_data(
-            sae=sae,
-            shard_paths=shard_paths,
-            mean=mean,
-            std=std,
-            device=device,
-            dict_size=dict_size,
-            encode_batch_size=encode_batch_size,
-        )
+        image_codes, pooled_original, pooled_reconstructed, fvu_stats = \
+            encode_val_data(
+                sae=sae,
+                shard_paths=shard_paths,
+                mean=mean,
+                std=std,
+                device=device,
+                dict_size=dict_size,
+                encode_batch_size=encode_batch_size,
+                compute_fvu=compute_fvu,
+            )
         enc_time = time.time() - t0
         print(f"Shared encoding: {image_codes.shape[0]} images in {format_time(enc_time)}")
         print(f"  image_codes:          {image_codes.shape}")
@@ -559,14 +650,18 @@ def main() -> None:
     overall_pbar = tqdm(active_metrics, desc="Overall progress", unit="metric",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} metrics [{elapsed}<{remaining}]")
 
-    # M1: FVU
+    # M1: FVU (already computed during shared encoding when possible)
     if "m1" in metrics_to_run:
         overall_pbar.set_description("M1 FVU")
         print("\n--- M1: FVU ---")
         t0 = time.time()
         try:
-            result = run_m1_fvu(sae, shard_paths, mean, std, device,
-                                dict_size, encode_batch_size)
+            if fvu_stats is not None:
+                result = fvu_stats
+                print("  (using stats from shared encoding pass)")
+            else:
+                result = run_m1_fvu(sae, shard_paths, mean, std, device,
+                                    dict_size, encode_batch_size)
             elapsed = time.time() - t0
             save_result(result, args.output_dir, backbone_name,
                         sae_config_name, "m1_fvu", "fvu")

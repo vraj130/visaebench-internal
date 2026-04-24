@@ -32,10 +32,10 @@ import yaml
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 DEFAULTS = {
-    "activation_root": "/mnt/NAS/data/ds5725/visaebench/activations",
+    "activation_root": "/mnt/NAS/data/ds5725/visaebench/activations_1M",
     "val_root": "/mnt/NAS/data/ds5725/visaebench/activations_val",
-    "checkpoint_root": "/mnt/NAS/data/ds5725/visaebench/checkpoints",
-    "results_root": "/mnt/NAS/data/ds5725/visaebench/results/raw",
+    "checkpoint_root": "/mnt/NAS/data/ds5725/visaebench/checkpoints_1M_60models",
+    "results_root": "/mnt/NAS/data/ds5725/visaebench/results/eval_1M_60models",
     "sweep_config": "configs/sweeps/main_sweep.yaml",
 }
 

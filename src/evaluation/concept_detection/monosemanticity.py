@@ -53,10 +53,12 @@ class MonosemanticityScore(MetricBase):
         top_k_images: int = 16,
         max_features: int = 2048,
         encode_batch_size: int = 512,
+        num_baseline_features: int = 1000,
     ):
         self.top_k_images = top_k_images
         self.max_features = max_features
         self.encode_batch_size = encode_batch_size
+        self.num_baseline_features = num_baseline_features
 
     # -- MetricBase interface --------------------------------------------------
 
@@ -136,6 +138,9 @@ class MonosemanticityScore(MetricBase):
         )
         # embeddings: dict[int, np.ndarray]  (image_idx → [768] vector)
 
+        # ── Step 4b: Compute baseline MS (random pseudo-features) ────────
+        baseline_ms = self._compute_baseline_ms(embeddings, seed)
+
         # ── Step 5: Compute per-feature MS ───────────────────────────────
         print(f"[M4] Computing MS for {len(sampled)} features...")
         ms_scores = np.full(len(sampled), np.nan, dtype=np.float64)
@@ -168,10 +173,18 @@ class MonosemanticityScore(MetricBase):
         valid_ms = ms_scores[~np.isnan(ms_scores)]
         print(f"[M4] Scored {len(valid_ms)} features successfully")
 
+        raw_ms = float(np.mean(valid_ms)) if len(valid_ms) > 0 else None
+        ms_normalized = (raw_ms - baseline_ms) if raw_ms is not None else None
+
+        print(f"[M4] Raw MS={raw_ms:.4f}, baseline={baseline_ms:.4f}, "
+              f"normalized={ms_normalized:.4f}")
+
         return {
-            "monosemanticity_score": float(np.mean(valid_ms)) if len(valid_ms) > 0 else None,
+            "monosemanticity_score": raw_ms,
             "ms_std": float(np.std(valid_ms)) if len(valid_ms) > 0 else None,
             "ms_median": float(np.median(valid_ms)) if len(valid_ms) > 0 else None,
+            "ms_baseline": baseline_ms,
+            "ms_normalized": ms_normalized,
             "num_features_scored": int(len(valid_ms)),
             "num_dead_features": num_dead,
             "cross_model": cross_model_name,
@@ -249,6 +262,47 @@ class MonosemanticityScore(MetricBase):
         import atexit
         atexit.register(lambda p=tmp_path: os.unlink(p))
         return result
+
+    def _compute_baseline_ms(
+        self,
+        embeddings: dict[int, np.ndarray],
+        seed: int,
+    ) -> float:
+        """Compute baseline MS from random pseudo-features.
+
+        Samples random groups of top_k images from the embedded set with
+        uniform weights and computes their mean pairwise cosine similarity.
+        This estimates the MS floor set by the scoring model's embedding
+        geometry, enabling cross-group normalization.
+        """
+        embed_indices = list(embeddings.keys())
+        n = len(embed_indices)
+        k = min(self.top_k_images, n)
+        rng = np.random.RandomState(seed + 9999)  # offset to avoid collision
+
+        print(f"[M4] Computing baseline MS ({self.num_baseline_features} "
+              f"pseudo-features, k={k}, {n} images)...")
+
+        baseline_scores = np.zeros(self.num_baseline_features, dtype=np.float64)
+
+        for i in range(self.num_baseline_features):
+            sample_idx = rng.choice(embed_indices, size=k, replace=False)
+            embeds = np.stack([embeddings[idx] for idx in sample_idx])
+            embeds_t = F.normalize(torch.from_numpy(embeds).float(), dim=1)
+
+            # Mean pairwise cosine similarity (uniform weights)
+            numer = 0.0
+            count = 0
+            for a in range(k):
+                for b in range(a + 1, k):
+                    numer += float((embeds_t[a] * embeds_t[b]).sum())
+                    count += 1
+            baseline_scores[i] = numer / count if count > 0 else 0.0
+
+        baseline_ms = float(np.mean(baseline_scores))
+        print(f"[M4] Baseline MS = {baseline_ms:.4f} "
+              f"(std={np.std(baseline_scores):.4f})")
+        return baseline_ms
 
     def _embed_images(
         self,

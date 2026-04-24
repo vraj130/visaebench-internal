@@ -14,7 +14,7 @@ DATA_ROOT: str = os.environ.get(
     "/mnt/NAS/data/ds5725/visaebench",
 )
 
-ACTIVATION_ROOT: str = os.path.join(DATA_ROOT, "activations")
+ACTIVATION_ROOT: str = os.path.join(DATA_ROOT, "activations_1M")
 CHECKPOINT_ROOT: str = os.path.join(DATA_ROOT, "checkpoints")
 DATASET_ROOT: str = os.path.join(DATA_ROOT, "datasets")
 

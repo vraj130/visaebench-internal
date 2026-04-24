@@ -24,6 +24,6 @@ k_values:
 # Training hyperparameters (applied to all runs)
 training:
   lr: 1e-3
-  batch_size: 4096
-  num_epochs: 4
+  batch_size: 8192
+  num_epochs: 1
   seed: 42

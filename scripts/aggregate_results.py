@@ -37,10 +37,21 @@ COLUMNS = [
     "sparse_k512",
     # M4: Monosemanticity
     "monosemanticity_score",
-    # M5: Cross-Domain (EuroSAT)
+    "ms_baseline",
+    "ms_normalized",
+    "ms_cross_model",
+    # M5: Cross-Domain (EuroSAT — deprecated, saturates at ~98%)
     "eurosat_raw",
     "eurosat_sae_k128",
     "eurosat_preservation",
+    "eurosat_recon_acc",
+    "eurosat_preservation_recon",
+    # M5: Cross-Domain (iNaturalist 2021 val — replacement metric)
+    "inat_raw",
+    "inat_sae_k128",
+    "inat_preservation",
+    "inat_recon_acc",
+    "inat_preservation_recon",
     # M6: Localization
     "localization_score",
     # M7: Absorption
@@ -64,7 +75,8 @@ def parse_filename(filename: str) -> tuple[str, str, str]:
         "m2_downstream",
         "m3_sparse_probing",
         "m4_monosemanticity",
-        "m5_cross_domain",
+        "m5_cross_domain_inat",  # iNat-only M5 run (listed before the shorter
+        "m5_cross_domain",       # prefix so endswith() matches the longer form first)
         "m6_localization",
         "m7_absorption",
     ]
@@ -126,17 +138,38 @@ def extract_m4(data: dict) -> dict:
     """Extract M4 monosemanticity fields."""
     return {
         "monosemanticity_score": data.get("monosemanticity_score"),
+        "ms_baseline": data.get("ms_baseline"),
+        "ms_normalized": data.get("ms_normalized"),
+        "ms_cross_model": data.get("cross_model"),
     }
 
 
 def extract_m5(data: dict) -> dict:
-    """Extract M5 cross-domain fields (EuroSAT)."""
+    """Extract M5 cross-domain fields for both EuroSAT and iNaturalist.
+
+    A single result JSON may contain either or both dataset blocks depending
+    on which loaders were passed to ``--m5_datasets``. Missing blocks leave
+    their columns as None, so two separate M5 runs (one per dataset) merge
+    cleanly into one row.
+    """
+    out: dict = {}
     eurosat = data.get("eurosat", {})
-    return {
-        "eurosat_raw": eurosat.get("raw_accuracy"),
-        "eurosat_sae_k128": eurosat.get("sae_k128_accuracy"),
-        "eurosat_preservation": eurosat.get("preservation_k128"),
-    }
+    if eurosat:
+        out["eurosat_raw"] = eurosat.get("raw_accuracy")
+        out["eurosat_sae_k128"] = eurosat.get("sae_k128_accuracy")
+        out["eurosat_preservation"] = eurosat.get("preservation_k128")
+        # New reconstruction-preservation columns (NaN for legacy EuroSAT
+        # result JSONs that predate the recon-probe addition).
+        out["eurosat_recon_acc"] = eurosat.get("recon_accuracy")
+        out["eurosat_preservation_recon"] = eurosat.get("preservation_recon")
+    inat = data.get("inaturalist", {})
+    if inat:
+        out["inat_raw"] = inat.get("raw_accuracy")
+        out["inat_sae_k128"] = inat.get("sae_k128_accuracy")
+        out["inat_preservation"] = inat.get("preservation_k128")
+        out["inat_recon_acc"] = inat.get("recon_accuracy")
+        out["inat_preservation_recon"] = inat.get("preservation_recon")
+    return out
 
 
 def extract_m6(data: dict) -> dict:
@@ -160,6 +193,7 @@ EXTRACTORS = {
     "m3_sparse_probing": extract_m3,
     "m4_monosemanticity": extract_m4,
     "m5_cross_domain": extract_m5,
+    "m5_cross_domain_inat": extract_m5,  # same extractor; reads "inaturalist" key
     "m6_localization": extract_m6,
     "m7_absorption": extract_m7,
 }
@@ -171,6 +205,10 @@ def parse_args() -> argparse.Namespace:
                    help="Directory containing per-metric JSON files.")
     p.add_argument("--output_csv", type=str, required=True,
                    help="Path to output CSV file.")
+    p.add_argument("--baseline_json", type=str, default=None,
+                   help="Path to MS baselines JSON (from compute_ms_baseline.py). "
+                        "Used for post-hoc normalization when ms_baseline is missing "
+                        "from result JSONs.")
     return p.parse_args()
 
 
@@ -219,6 +257,28 @@ def main() -> None:
         print("No valid results found.")
         return
 
+    # Post-hoc MS baseline normalization (for results that lack ms_baseline)
+    if args.baseline_json:
+        with open(args.baseline_json) as f:
+            baselines = json.load(f)
+        bl_lookup = {sm: info["baseline_ms"]
+                     for sm, info in baselines["baselines"].items()}
+        # Cross-model map: backbone → scoring model
+        from src.evaluation.concept_detection.monosemanticity import CROSS_MODEL_MAP
+        patched = 0
+        for key, row in rows.items():
+            if "ms_baseline" not in row and "monosemanticity_score" in row:
+                backbone = row["backbone"]
+                scoring_model = CROSS_MODEL_MAP.get(backbone)
+                if scoring_model and scoring_model in bl_lookup:
+                    bl = bl_lookup[scoring_model]
+                    row["ms_baseline"] = bl
+                    row["ms_normalized"] = row["monosemanticity_score"] - bl
+                    row["ms_cross_model"] = scoring_model
+                    patched += 1
+        if patched:
+            print(f"Applied post-hoc MS baseline normalization to {patched} rows")
+
     # Write CSV
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
 
@@ -232,7 +292,11 @@ def main() -> None:
 
     # Print summary table
     print()
-    header = f"{'backbone':20s} {'config':22s} {'FVU':>8s} {'L0':>6s} {'Pres':>6s} {'AUC':>6s} {'MS':>6s} {'Loc':>6s} {'Abs':>6s}"
+    has_norm = any("ms_normalized" in r for r in rows.values())
+    if has_norm:
+        header = f"{'backbone':20s} {'config':22s} {'FVU':>8s} {'L0':>6s} {'Pres':>6s} {'AUC':>6s} {'MS':>6s} {'MS_n':>6s} {'Loc':>6s} {'Abs':>6s}"
+    else:
+        header = f"{'backbone':20s} {'config':22s} {'FVU':>8s} {'L0':>6s} {'Pres':>6s} {'AUC':>6s} {'MS':>6s} {'Loc':>6s} {'Abs':>6s}"
     print(header)
     print("-" * len(header))
     for key in sorted(rows.keys()):
@@ -242,9 +306,13 @@ def main() -> None:
         pres = f"{r['preservation_ratio']:.3f}" if "preservation_ratio" in r else "—"
         auc = f"{r['sparse_probing_auc']:.3f}" if "sparse_probing_auc" in r else "—"
         ms = f"{r['monosemanticity_score']:.3f}" if "monosemanticity_score" in r else "—"
+        ms_n = f"{r['ms_normalized']:.3f}" if "ms_normalized" in r else "—"
         loc = f"{r['localization_score']:.3f}" if "localization_score" in r else "—"
         abs_rate = f"{r['absorption_rate']:.3f}" if "absorption_rate" in r else "—"
-        print(f"{r['backbone']:20s} {r['sae_config']:22s} {fvu:>8s} {l0:>6s} {pres:>6s} {auc:>6s} {ms:>6s} {loc:>6s} {abs_rate:>6s}")
+        if has_norm:
+            print(f"{r['backbone']:20s} {r['sae_config']:22s} {fvu:>8s} {l0:>6s} {pres:>6s} {auc:>6s} {ms:>6s} {ms_n:>6s} {loc:>6s} {abs_rate:>6s}")
+        else:
+            print(f"{r['backbone']:20s} {r['sae_config']:22s} {fvu:>8s} {l0:>6s} {pres:>6s} {auc:>6s} {ms:>6s} {loc:>6s} {abs_rate:>6s}")
 
 
 if __name__ == "__main__":

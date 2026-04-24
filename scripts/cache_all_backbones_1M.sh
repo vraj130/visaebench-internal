@@ -26,10 +26,10 @@ SHARD_SIZE="${SHARD_SIZE:-5000}"
 LAYER="${LAYER:-11}"
 HALF="${HALF:-1}"              # 1 = float16 (recommended), 0 = float32
 NUM_WORKERS="${NUM_WORKERS:-4}"
-PARALLEL="${PARALLEL:-0}"      # 1 = launch all backbones in parallel on separate GPUs
+PARALLEL="${PARALLEL:-1}"      # 1 = launch all backbones in parallel on separate GPUs
 GPU_OFFSET="${GPU_OFFSET:-0}"  # first GPU id to use
 
-ALL_BACKBONES="clip_vitb16 dinov2_vitb14 siglip_vitb16 mae_vitb16 deit_vitb16"
+ALL_BACKBONES="mae_vitb16 deit_vitb16"
 
 # Use CLI args if provided, otherwise all 5
 if [ $# -gt 0 ]; then

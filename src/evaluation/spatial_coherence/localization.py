@@ -156,6 +156,25 @@ class FeatureLocalizationScore(MetricBase):
             None if np.isnan(x) else float(x) for x in per_feature
         ]
 
+        # Null-expectation test: E(I) = -1/(n-1) under spatial randomness
+        null_expectation = -1.0 / (num_patches - 1)
+        if num_evaluable > 0:
+            mean_mi = float(np.mean(evaluable_scores))
+            std_mi = float(np.std(evaluable_scores))
+            se = std_mi / np.sqrt(num_evaluable)
+            z_vs_null = (mean_mi - null_expectation) / se if se > 0 else 0.0
+            indistinguishable = bool(abs(z_vs_null) < 2.0)
+        else:
+            mean_mi = None
+            std_mi = None
+            z_vs_null = None
+            indistinguishable = None
+
+        if indistinguishable:
+            print(f"[M6] WARNING: mean Moran's I ({mean_mi:.6f}) is within 2 SE "
+                  f"of null expectation ({null_expectation:.6f}), z={z_vs_null:.2f}. "
+                  f"Spatial coherence is indistinguishable from random.")
+
         return {
             "config": {
                 "grid_size": [self.grid_h, self.grid_w],
@@ -164,11 +183,14 @@ class FeatureLocalizationScore(MetricBase):
                 "min_valid_images": self.min_valid_images,
             },
             "results": {
-                "mean_morans_i": float(np.mean(evaluable_scores)) if num_evaluable > 0 else None,
+                "mean_morans_i": mean_mi,
                 "median_morans_i": float(np.median(evaluable_scores)) if num_evaluable > 0 else None,
-                "std_morans_i": float(np.std(evaluable_scores)) if num_evaluable > 0 else None,
+                "std_morans_i": std_mi,
                 "percentile_25": float(np.percentile(evaluable_scores, 25)) if num_evaluable > 0 else None,
                 "percentile_75": float(np.percentile(evaluable_scores, 75)) if num_evaluable > 0 else None,
+                "null_expectation": null_expectation,
+                "z_vs_null": float(z_vs_null) if z_vs_null is not None else None,
+                "spatial_coherence_indistinguishable_from_null": indistinguishable,
                 "num_evaluable_features": num_evaluable,
                 "num_total_features": dict_size,
                 "frac_evaluable": num_evaluable / dict_size if dict_size > 0 else 0.0,
